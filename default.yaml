@@ -1,0 +1,14 @@
+n_epochs: 200
+dataset_name: img_align_celeba
+batch_size: 4
+lr: 0.0002
+b1: 0.5
+b2: 0.999
+decay_epoch: 100
+n_cpu: 8
+hr_height: 256
+hr_width: 256
+channels: 3
+sample_interval: 100
+checkpoint_interval: -1
+log_dirs: ./runs
