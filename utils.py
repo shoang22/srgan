@@ -2,6 +2,7 @@ from PIL import Image
 import numpy as np
 import cv2
 import torch
+import torch.nn as nn
 import math
 from torchvision.utils import make_grid
 from torchvision import transforms
@@ -89,3 +90,11 @@ def tensor_from_path(img_path: str, h: int = 256, w: int = 256) -> torch.Tensor:
         img = img.unsqueeze(0)
 
     return img
+
+
+def make_gen_real_grid(gen_hr, imgs_lr, n: int):
+    imgs_lr = nn.functional.interpolate(imgs_lr[:n], scale_factor=4)
+    gen_hr = make_grid(gen_hr[:n], nrow=1, normalize=True)
+    imgs_lr = make_grid(imgs_lr, nrow=1, normalize=True)
+    img_grid = torch.cat((imgs_lr, gen_hr), -1)
+    return img_grid

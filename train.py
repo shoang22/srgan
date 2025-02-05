@@ -1,302 +1,304 @@
-import argparse
+from glob import glob
 import os
 
 import yaml
 import click
 from torchvision.models.vision_transformer import math
-from torchvision.utils import save_image, make_grid
+from torchvision.utils import save_image
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard.writer import SummaryWriter
-import torch.nn as nn
 import torch
 
 from models import Discriminator, GeneratorResNet, FeatureExtractor
 from datasets import ImageDataset
+from utils import make_gen_real_grid
 from logger import logger
 
 
-def make_gen_real_grid(gen_hr, imgs_lr, n: int):
-    imgs_lr = nn.functional.interpolate(imgs_lr[:n], scale_factor=4)
-    gen_hr = make_grid(gen_hr[:n], nrow=1, normalize=True)
-    imgs_lr = make_grid(imgs_lr, nrow=1, normalize=True)
-    img_grid = torch.cat((imgs_lr, gen_hr), -1)
-    return img_grid
+class Trainer:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.hr_shape = (cfg["hr_height"], cfg["hr_width"])
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.generator = GeneratorResNet()
+        self.discriminator = Discriminator(
+            input_shape=(cfg["channels"], *self.hr_shape)
+        )
+        self.feature_extractor = FeatureExtractor()
+        self.generator = self.generator.to(device=self.device)
+        self.discriminator = self.discriminator.to(device=self.device)
+        self.feature_extractor = self.feature_extractor.to(device=self.device)
 
+        # Losses
+        self.criterion_GAN = torch.nn.MSELoss()
+        self.criterion_content = torch.nn.L1Loss()
+        self.criterion_GAN = self.criterion_GAN.to(device=self.device)
+        self.criterion_content = self.criterion_content.to(device=self.device)
 
-os.makedirs("images", exist_ok=True)
-os.makedirs("saved_models", exist_ok=True)
+        # Optimizers
+        self.optimizer_G = torch.optim.Adam(
+            self.generator.parameters(), lr=cfg["lr"], betas=(cfg["b1"], cfg["b2"])
+        )
+        self.optimizer_D = torch.optim.Adam(
+            self.discriminator.parameters(), lr=cfg["lr"], betas=(cfg["b1"], cfg["b2"])
+        )
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--epoch", type=int, default=0, help="epoch to start training from")
-parser.add_argument(
-    "--n_epochs", type=int, default=200, help="number of epochs of training"
-)
-parser.add_argument(
-    "--dataset_name", type=str, default="img_align_celeba", help="name of the dataset"
-)
-parser.add_argument("--batch_size", type=int, default=4, help="size of the batches")
-parser.add_argument("--lr", type=float, default=0.0002, help="adam: learning rate")
-parser.add_argument(
-    "--b1",
-    type=float,
-    default=0.5,
-    help="adam: decay of first order momentum of gradient",
-)
-parser.add_argument(
-    "--b2",
-    type=float,
-    default=0.999,
-    help="adam: decay of first order momentum of gradient",
-)
-parser.add_argument(
-    "--decay_epoch", type=int, default=100, help="epoch from which to start lr decay"
-)
-parser.add_argument(
-    "--n_cpu",
-    type=int,
-    default=8,
-    help="number of cpu threads to use during batch generation",
-)
-parser.add_argument("--hr_height", type=int, default=256, help="high res. image height")
-parser.add_argument("--hr_width", type=int, default=256, help="high res. image width")
-parser.add_argument("--channels", type=int, default=3, help="number of image channels")
-parser.add_argument(
-    "--sample_interval",
-    type=int,
-    default=100,
-    help="interval between saving image samples",
-)
-parser.add_argument(
-    "--checkpoint_interval",
-    type=int,
-    default=-1,
-    help="interval between model checkpoints",
-)
-opt = parser.parse_args()
-logger.info(opt)
+        self.writer = SummaryWriter(log_dir=self.cfg["path"]["writer"])
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-writer = SummaryWriter(log_dir="./runs")
+        for _, p in self.cfg["path"]:
+            os.makedirs(p, exist_ok=True)
 
-hr_shape = (opt.hr_height, opt.hr_width)
+        dataset = ImageDataset(
+            os.path.join(self.cfg["path"]["data"], cfg["dataset_name"]),
+            hr_shape=self.hr_shape,
+        )
+        train_length = int(len(dataset) * 0.7)
+        test_length = len(dataset) - train_length
+        train_dataset, test_dataset = torch.utils.data.random_split(
+            dataset=dataset, lengths=(train_length, test_length)
+        )
+        self.train_dataloader = DataLoader(
+            dataset=train_dataset,
+            batch_size=cfg["batch_size"],
+            shuffle=True,
+            num_workers=cfg["n_cpu"],
+        )
+        self.test_dataloader = DataLoader(
+            dataset=test_dataset,
+            batch_size=cfg["batch_size"],
+            shuffle=False,
+            num_workers=cfg["n_cpu"],
+        )
 
-# Initialize generator and discriminator
-generator = GeneratorResNet()
-discriminator = Discriminator(input_shape=(opt.channels, *hr_shape))
-feature_extractor = FeatureExtractor()
+        self.global_step = 0
 
-# Set feature extractor to inference mode
-feature_extractor.eval()
+    def train(self):
+        if resume_step := self.cfg["step"]:
+            files = glob(self.cfg["path"]["models"] + "*.pth")
+            if resume_step == -1:
+                sorted(os.path.join(self.cfg["path"]))
+                step = ...
+            else:
+                step = self.cfg["step"]
 
-# Losses
-criterion_GAN = torch.nn.MSELoss()
-criterion_content = torch.nn.L1Loss()
-
-generator = generator.to(device=device)
-discriminator = discriminator.to(device=device)
-feature_extractor = feature_extractor.to(device=device)
-criterion_GAN = criterion_GAN.to(device=device)
-criterion_content = criterion_content.to(device=device)
-
-if opt.epoch != 0:
-    # Load pretrained models
-    generator.load_state_dict(torch.load("saved_models/generator_%d.pth"))
-    discriminator.load_state_dict(torch.load("saved_models/discriminator_%d.pth"))
-
-# Optimizers
-optimizer_G = torch.optim.Adam(
-    generator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2)
-)
-optimizer_D = torch.optim.Adam(
-    discriminator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2)
-)
-
-dataset = ImageDataset("../data/%s" % opt.dataset_name, hr_shape=hr_shape)
-
-train_length = int(len(dataset) * 0.7)
-test_length = len(dataset) - train_length
-train_dataset, test_dataset = torch.utils.data.random_split(
-    dataset=dataset, lengths=(train_length, test_length)
-)
-
-train_dataloader = DataLoader(
-    dataset=train_dataset,
-    batch_size=opt.batch_size,
-    shuffle=True,
-    num_workers=opt.n_cpu,
-)
-test_dataloader = DataLoader(
-    dataset=test_dataset,
-    batch_size=opt.batch_size,
-    shuffle=False,
-    num_workers=opt.n_cpu,
-)
-
-
-# ----------
-#  Training
-# ----------
-
-
-global_step = 0
-for epoch in range(opt.epoch, opt.n_epochs):
-    generator.train()
-    discriminator.train()
-    for i, imgs in enumerate(train_dataloader):
-        # Configure model input
-        imgs_lr = imgs["lr"].to(device=device)
-        imgs_hr = imgs["hr"].to(device=device)
-
-        # Adversarial ground truths
-        valid = torch.ones(
-            (imgs_lr.size(0), *discriminator.output_shape), requires_grad=False
-        ).to(device=device)
-        fake = torch.zeros(
-            (imgs_lr.size(0), *discriminator.output_shape), requires_grad=False
-        ).to(device=device)
-
-        # ------------------
-        #  Train Generators
-        # ------------------
-
-        optimizer_G.zero_grad()
-
-        # Generate a high resolution image from low resolution input
-        gen_hr = generator(imgs_lr)
-        # Adversarial loss
-        loss_GAN = criterion_GAN(discriminator(gen_hr), valid)
-
-        # Content loss
-        gen_features = feature_extractor(gen_hr)
-        real_features = feature_extractor(imgs_hr)
-        loss_content = criterion_content(gen_features, real_features.detach())
-
-        # Total loss
-        loss_G = loss_content + 1e-3 * loss_GAN
-
-        loss_G.backward()
-        optimizer_G.step()
-
-        # ---------------------
-        #  Train Discriminator
-        # ---------------------
-
-        optimizer_D.zero_grad()
-
-        # Loss of real and fake images
-        loss_real = criterion_GAN(discriminator(imgs_hr), valid)
-        loss_fake = criterion_GAN(discriminator(gen_hr.detach()), fake)
-
-        # Total loss
-        loss_D = (loss_real + loss_fake) / 2
-
-        loss_D.backward()
-        optimizer_D.step()
-
-        # --------------
-        #  Log Progress
-        # --------------
-
-        logger.info(
-            "[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f]"
-            % (
-                epoch,
-                opt.n_epochs,
-                i,
-                len(train_dataloader),
-                loss_D.item(),
-                loss_G.item(),
+            resume_state = torch.load(
+                os.path.join(self.cfg["path"]["training_state"], "{}".format(step))
             )
-        )
+            self.resume_training(state=resume_state)
+            self.load_network(load_path_G=..., load_path_D=...)
 
-        writer.add_scalar("/train/loss/discriminator", loss_D, global_step)
-        writer.add_scalar("/train/loss/generator", loss_G, global_step)
-        writer.add_image(
-            "/train/outputs",
-            make_gen_real_grid(gen_hr=gen_hr, imgs_lr=imgs_lr, n=1),
-            global_step=global_step,
-        )
-        global_step += 1
+        while True:
+            self.train_loop()
+            self.eval_loop()
 
-        batches_done = epoch * len(train_dataloader) + i
-        if batches_done % opt.sample_interval == 0:
-            # Save image grid with upsampled inputs and SRGAN outputs
-            img_grid = make_gen_real_grid(gen_hr=gen_hr, imgs_lr=imgs_lr, n=4)
-            # Normalize=False because we already normalize in make_gen_real_grid
-            save_image(img_grid, "images/%d.png" % batches_done, normalize=False)
+    def train_loop(self):
+        self.generator.train()
+        self.discriminator.train()
 
-    if opt.checkpoint_interval != -1 and epoch % opt.checkpoint_interval == 0:
-        # Save model checkpoints
-        torch.save(generator.state_dict(), "saved_models/generator_%d.pth" % epoch)
-        torch.save(
-            discriminator.state_dict(), "saved_models/discriminator_%d.pth" % epoch
-        )
-
-    # ----------
-    # Evaluation
-    # ----------
-
-    generator.eval()
-    discriminator.eval()
-
-    running_vloss_D = 0.0
-    running_vloss_G = 0.0
-
-    best_vloss_G = math.inf
-
-    with torch.no_grad():
-        for i, imgs in enumerate(test_dataloader):
-            imgs_lr = imgs["lr"].to(device=device)
-            imgs_hr = imgs["hr"].to(device=device)
+        for i, imgs in enumerate(self.train_dataloader):
+            # Configure model input
+            imgs_lr = imgs["lr"].to(device=self.device)
+            imgs_hr = imgs["hr"].to(device=self.device)
 
             # Adversarial ground truths
             valid = torch.ones(
-                (imgs_lr.size(0), *discriminator.output_shape), requires_grad=False
-            ).to(device=device)
+                (imgs_lr.size(0), *self.discriminator.output_shape), requires_grad=False
+            ).to(device=self.device)
             fake = torch.zeros(
-                (imgs_lr.size(0), *discriminator.output_shape), requires_grad=False
-            ).to(device=device)
+                (imgs_lr.size(0), *self.discriminator.output_shape), requires_grad=False
+            ).to(device=self.device)
 
-            gen_hr = generator(imgs_lr)
+            # ------------------
+            #  Train Generators
+            # ------------------
 
-            loss_GAN = criterion_GAN(discriminator(gen_hr), valid)
+            self.optimizer_G.zero_grad()
 
-            gen_features = feature_extractor(gen_hr)
-            real_features = feature_extractor(imgs_hr)
-            loss_content = criterion_content(gen_features, real_features)
+            # Generate a high resolution image from low resolution input
+            gen_hr = self.generator(imgs_lr)
+            # Adversarial loss
+            loss_GAN = self.criterion_GAN(self.discriminator(gen_hr), valid)
 
+            # Content loss
+            gen_features = self.feature_extractor(gen_hr)
+            real_features = self.feature_extractor(imgs_hr)
+            loss_content = self.criterion_content(gen_features, real_features.detach())
+
+            # Total loss
             loss_G = loss_content + 1e-3 * loss_GAN
-            running_vloss_G += loss_G
 
-            loss_real = criterion_GAN(discriminator(imgs_hr), valid)
-            loss_fake = criterion_GAN(discriminator(gen_hr), fake)
+            loss_G.backward()
+            self.optimizer_G.step()
 
+            # ---------------------
+            #  Train Discriminator
+            # ---------------------
+
+            self.optimizer_D.zero_grad()
+
+            # Loss of real and fake images
+            loss_real = self.criterion_GAN(self.discriminator(imgs_hr), valid)
+            loss_fake = self.criterion_GAN(self.discriminator(gen_hr.detach()), fake)
+
+            # Total loss
             loss_D = (loss_real + loss_fake) / 2
-            running_vloss_D += loss_D
 
-            writer.add_image(
-                "/test/outputs",
-                make_gen_real_grid(gen_hr=gen_hr, imgs_lr=imgs_lr, n=1),
-                global_step=epoch,
+            loss_D.backward()
+            self.optimizer_D.step()
+
+            # --------------
+            #  Log Progress
+            # --------------
+
+            logger.info(
+                "[Step %d] [Batch %d/%d] [D loss: %f] [G loss: %f]"
+                % (
+                    self.global_step,
+                    i,
+                    len(self.train_dataloader),
+                    loss_D.item(),
+                    loss_G.item(),
+                )
             )
 
-    avg_vloss_D = running_vloss_D / len(test_dataloader)
-    avg_vloss_G = running_vloss_G / len(test_dataloader)
-    writer.add_scalar("/test/loss/discriminator", avg_vloss_D, epoch)
-    writer.add_scalar("/test/loss/generator", avg_vloss_G, epoch)
-    writer.flush()
+            self.writer.add_scalar(
+                "/train/loss/discriminator", loss_D, self.global_step
+            )
+            self.writer.add_scalar("/train/loss/generator", loss_G, self.global_step)
+            self.writer.add_image(
+                "/train/outputs",
+                make_gen_real_grid(gen_hr=gen_hr, imgs_lr=imgs_lr, n=1),
+                global_step=self.global_step,
+            )
+            self.global_step += 1
 
-    if best_vloss_G > avg_vloss_G:
-        # Save model checkpoints
-        torch.save(generator.state_dict(), "saved_models/generator_best.pth")
-        best_vloss_G = avg_vloss_G
+            if self.global_step % self.cfg["sample_interval"] == 0:
+                # Save image grid with upsampled inputs and SRGAN outputs
+                img_grid = make_gen_real_grid(gen_hr=gen_hr, imgs_lr=imgs_lr, n=4)
+                # Normalize=False because we already normalize in make_gen_real_grid
+                save_image(
+                    img_grid,
+                    os.path.join(self.cfg["path"]["images"], f"{self.global_step}.png"),
+                    normalize=False,
+                )
 
-    logger.info(
-        "[Epoch %d/%d] [Eval] [Avg D loss: %f] [Avg G loss: %f]"
-        % (
-            epoch,
-            opt.n_epochs,
-            avg_vloss_D,
-            avg_vloss_G,
+        if (
+            self.cfg["checkpoint_interval"] != -1
+            and self.global_step % self.cfg["checkpoint_interval"] == 0
+        ):
+            self.save_network(step=self.global_step)
+            self.save_training_state(step=self.global_step)
+
+    def eval_loop(self):
+        self.generator.eval()
+        self.discriminator.eval()
+
+        running_vloss_D = 0.0
+        running_vloss_G = 0.0
+
+        best_vloss_G = math.inf
+
+        with torch.no_grad():
+            for _, imgs in enumerate(self.test_dataloader):
+                imgs_lr = imgs["lr"].to(device=self.device)
+                imgs_hr = imgs["hr"].to(device=self.device)
+
+                # Adversarial ground truths
+                valid = torch.ones(
+                    (imgs_lr.size(0), *self.discriminator.output_shape),
+                    requires_grad=False,
+                ).to(device=self.device)
+                fake = torch.zeros(
+                    (imgs_lr.size(0), *self.discriminator.output_shape),
+                    requires_grad=False,
+                ).to(device=self.device)
+
+                gen_hr = self.generator(imgs_lr)
+
+                loss_GAN = self.criterion_GAN(self.discriminator(gen_hr), valid)
+
+                gen_features = self.feature_extractor(gen_hr)
+                real_features = self.feature_extractor(imgs_hr)
+                loss_content = self.criterion_content(gen_features, real_features)
+
+                loss_G = loss_content + 1e-3 * loss_GAN
+                running_vloss_G += loss_G
+
+                loss_real = self.criterion_GAN(self.discriminator(imgs_hr), valid)
+                loss_fake = self.criterion_GAN(self.discriminator(gen_hr), fake)
+
+                loss_D = (loss_real + loss_fake) / 2
+                running_vloss_D += loss_D
+
+                self.writer.add_image(
+                    "/test/outputs",
+                    make_gen_real_grid(gen_hr=gen_hr, imgs_lr=imgs_lr, n=1),
+                    global_step=self.global_step,
+                )
+
+        avg_vloss_D = running_vloss_D / len(self.test_dataloader)
+        avg_vloss_G = running_vloss_G / len(self.test_dataloader)
+        self.writer.add_scalar(
+            "/test/loss/discriminator", avg_vloss_D, self.global_step
         )
-    )
+        self.writer.add_scalar("/test/loss/generator", avg_vloss_G, self.global_step)
+        self.writer.flush()
+
+        if best_vloss_G > avg_vloss_G:
+            # Save model checkpoints
+            torch.save(
+                self.generator.state_dict(),
+                os.path.join(self.cfg["path"]["models"], "G_best.pth"),
+            )
+            best_vloss_G = avg_vloss_G
+
+        logger.info(
+            "[Steps %d] [Eval] [Avg D loss: %f] [Avg G loss: %f]"
+            % (
+                self.global_step,
+                avg_vloss_D,
+                avg_vloss_G,
+            )
+        )
+
+    def save_training_state(self, step):
+        """Save training state and optimizers so we can resume training"""
+        state = {"step": step}
+        state["optimizer_G"] = self.optimizer_G.state_dict()
+        state["optimizer_D"] = self.optimizer_D.state_dict()
+        save_fname = f"{step}.state"
+        save_path = os.path.join(self.cfg["path"]["training_state"], save_fname)
+        torch.save(state, save_path)
+
+    def resume_training(self, state):
+        """Load training state and optimizers so we can resume training"""
+        self.optimizer_G.load_state_dict(state["optimizer_G"])
+        self.optimizer_D.load_state_dict(state["optimizer_D"])
+
+    def save_network(self, step):
+        torch.save(
+            self.generator.state_dict(),
+            os.path.join(self.cfg["path"]["models"], f"G_{step}.pth"),
+        )
+        torch.save(
+            self.discriminator.state_dict(),
+            os.path.join(self.cfg["path"]["models"], f"D_{step}.pth"),
+        )
+
+    def load_network(self, load_path_G, load_path_D, strict=True):
+        self.generator.load_state_dict(torch.load(load_path_G), strict=strict)
+        self.discriminator.load_state_dict(torch.load(load_path_D), strict=strict)
+
+
+@click.command
+@click.option("--cfg_file", type=str, help="Path of config file.")
+def main(cfg_file: str):
+    with open(cfg_file, "r") as file:
+        cfg = yaml.safe_load(file)
+
+    trainer = Trainer(cfg=cfg)
+    trainer.train()
+
+
+if __name__ == "__main__":
+    main()
