@@ -1,0 +1,23 @@
+n_epochs: 3
+resume_epoch: ~
+n_train_steps_per_epoch: 10
+n_eval_steps_per_epoch: 10
+dataset_name: img_align_celeba
+batch_size: 32
+lr: 0.0002
+b1: 0.5
+b2: 0.999
+n_cpu: 8
+decay_epoch: 100
+hr_height: 256
+hr_width: 256
+channels: 3
+sample_interval: 1
+checkpoint_interval: 1
+path:
+  writer: ./temp/runs
+  data: ../data
+  models: ./temp/saved_models
+  training_state: ./temp/states
+  images: ./temp/images
+
