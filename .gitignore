@@ -177,3 +177,5 @@ images/
 outputs/
 runs/
 saved_models/
+temp/
+states/

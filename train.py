@@ -1,5 +1,6 @@
 from glob import glob
 import os
+import re
 
 import yaml
 import click
@@ -45,7 +46,7 @@ class Trainer:
 
         self.writer = SummaryWriter(log_dir=self.cfg["path"]["writer"])
 
-        for _, p in self.cfg["path"]:
+        for _, p in self.cfg["path"].items():
             os.makedirs(p, exist_ok=True)
 
         dataset = ImageDataset(
@@ -70,32 +71,49 @@ class Trainer:
             num_workers=cfg["n_cpu"],
         )
 
-        self.global_step = 0
+    def resume_training(self):
+        self.global_step = 1
+        self.epoch = 1
 
-    def train(self):
-        if resume_step := self.cfg["step"]:
-            files = glob(self.cfg["path"]["models"] + "*.pth")
-            if resume_step == -1:
-                sorted(os.path.join(self.cfg["path"]))
-                step = ...
+        r = re.compile(r"(\d+)")
+        mfp = glob(os.path.join(self.cfg["path"]["models"], "*_*[0-9].pth"))
+        sfp = glob(os.path.join(self.cfg["path"]["training_state"], "*[0-9].state"))
+        if (resume_epoch := self.cfg["resume_epoch"]) and len(mfp) > 0 and len(sfp) > 0:
+            if resume_epoch == -1:
+                mepochs = set([int(r.findall(i)[0]) for i in mfp])
+                sepochs = set([int(r.findall(i)[0]) for i in sfp])
+                epoch = max(mepochs.intersection(sepochs))
             else:
-                step = self.cfg["step"]
+                epoch = resume_epoch
 
             resume_state = torch.load(
-                os.path.join(self.cfg["path"]["training_state"], "{}".format(step))
+                os.path.join(self.cfg["path"]["training_state"], f"{epoch}.state")
             )
-            self.resume_training(state=resume_state)
-            self.load_network(load_path_G=..., load_path_D=...)
+            self.load_training_state(state=resume_state)
+            path_G = os.path.join(self.cfg["path"]["models"], f"G_{epoch}.pth")
+            path_D = os.path.join(self.cfg["path"]["models"], f"D_{epoch}.pth")
+            self.load_network(load_path_G=path_G, load_path_D=path_D)
 
-        while True:
-            self.train_loop()
-            self.eval_loop()
+            self.global_step = epoch * len(self.train_dataloader)
+            self.epoch = epoch
 
-    def train_loop(self):
+        self.train()
+
+    def train(self):
+        logger.info(f"Starting training at epoch: {self.epoch}")
+        while self.epoch <= self.cfg["n_epochs"]:
+            self.train_loop(n_steps=self.cfg["n_train_steps_per_epoch"])
+            self.eval_loop(n_steps=self.cfg["n_eval_steps_per_epoch"])
+            self.epoch += 1
+
+    def train_loop(self, n_steps: int | None = None):
         self.generator.train()
         self.discriminator.train()
 
         for i, imgs in enumerate(self.train_dataloader):
+            if n_steps and i >= n_steps:
+                break
+
             # Configure model input
             imgs_lr = imgs["lr"].to(device=self.device)
             imgs_hr = imgs["hr"].to(device=self.device)
@@ -151,10 +169,11 @@ class Trainer:
             # --------------
 
             logger.info(
-                "[Step %d] [Batch %d/%d] [D loss: %f] [G loss: %f]"
+                "[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f]"
                 % (
-                    self.global_step,
-                    i,
+                    self.epoch,
+                    self.cfg["n_epochs"],
+                    i + 1,
                     len(self.train_dataloader),
                     loss_D.item(),
                     loss_G.item(),
@@ -184,12 +203,12 @@ class Trainer:
 
         if (
             self.cfg["checkpoint_interval"] != -1
-            and self.global_step % self.cfg["checkpoint_interval"] == 0
+            and self.epoch % self.cfg["checkpoint_interval"] == 0
         ):
-            self.save_network(step=self.global_step)
-            self.save_training_state(step=self.global_step)
+            self.save_network(epoch=self.epoch)
+            self.save_training_state(epoch=self.epoch)
 
-    def eval_loop(self):
+    def eval_loop(self, n_steps: int | None = None):
         self.generator.eval()
         self.discriminator.eval()
 
@@ -199,7 +218,10 @@ class Trainer:
         best_vloss_G = math.inf
 
         with torch.no_grad():
-            for _, imgs in enumerate(self.test_dataloader):
+            for i, imgs in enumerate(self.test_dataloader):
+                if n_steps is not None and i >= n_steps:
+                    break
+
                 imgs_lr = imgs["lr"].to(device=self.device)
                 imgs_hr = imgs["hr"].to(device=self.device)
 
@@ -253,36 +275,37 @@ class Trainer:
             best_vloss_G = avg_vloss_G
 
         logger.info(
-            "[Steps %d] [Eval] [Avg D loss: %f] [Avg G loss: %f]"
+            "[Epoch %d/%d] [Eval] [Avg D loss: %f] [Avg G loss: %f]"
             % (
-                self.global_step,
+                self.epoch,
+                self.cfg["n_epochs"],
                 avg_vloss_D,
                 avg_vloss_G,
             )
         )
 
-    def save_training_state(self, step):
+    def save_training_state(self, epoch):
         """Save training state and optimizers so we can resume training"""
-        state = {"step": step}
+        state = {"epoch": epoch}
         state["optimizer_G"] = self.optimizer_G.state_dict()
         state["optimizer_D"] = self.optimizer_D.state_dict()
-        save_fname = f"{step}.state"
+        save_fname = f"{epoch}.state"
         save_path = os.path.join(self.cfg["path"]["training_state"], save_fname)
         torch.save(state, save_path)
 
-    def resume_training(self, state):
+    def load_training_state(self, state):
         """Load training state and optimizers so we can resume training"""
         self.optimizer_G.load_state_dict(state["optimizer_G"])
         self.optimizer_D.load_state_dict(state["optimizer_D"])
 
-    def save_network(self, step):
+    def save_network(self, epoch):
         torch.save(
             self.generator.state_dict(),
-            os.path.join(self.cfg["path"]["models"], f"G_{step}.pth"),
+            os.path.join(self.cfg["path"]["models"], f"G_{epoch}.pth"),
         )
         torch.save(
             self.discriminator.state_dict(),
-            os.path.join(self.cfg["path"]["models"], f"D_{step}.pth"),
+            os.path.join(self.cfg["path"]["models"], f"D_{epoch}.pth"),
         )
 
     def load_network(self, load_path_G, load_path_D, strict=True):
@@ -297,7 +320,7 @@ def main(cfg_file: str):
         cfg = yaml.safe_load(file)
 
     trainer = Trainer(cfg=cfg)
-    trainer.train()
+    trainer.resume_training()
 
 
 if __name__ == "__main__":
